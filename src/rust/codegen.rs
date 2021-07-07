@@ -95,10 +95,11 @@ pub fn gen_page_switch_check(
 
     gen_get_eip(ctx.builder);
     let address_local = ctx.builder.set_new_local();
-    gen_get_phys_eip(ctx, &address_local);
+    gen_get_phys_eip_plus_mem(ctx, &address_local);
     ctx.builder.free_local(address_local);
 
-    ctx.builder.const_i32(next_block_addr as i32);
+    ctx.builder
+        .const_i32(next_block_addr as i32 + unsafe { memory::mem8 } as i32);
     ctx.builder.ne_i32();
 
     if cfg!(debug_assertions) {
@@ -258,6 +259,26 @@ pub fn gen_set_reg16(ctx: &mut JitContext, r: u32) {
     gen_set_reg16_local(ctx.builder, &ctx.register_locals[r as usize]);
 }
 
+pub fn gen_set_reg16_unmasked(ctx: &mut JitContext, r: u32) {
+    if cfg!(debug_assertions) {
+        let val = ctx.builder.set_new_local();
+        ctx.builder.get_local(&val);
+        ctx.builder.const_i32(!0xFFFF);
+        ctx.builder.and_i32();
+        ctx.builder.if_void();
+        ctx.builder.unreachable();
+        ctx.builder.block_end();
+        ctx.builder.get_local(&val);
+        ctx.builder.free_local(val);
+    }
+
+    ctx.builder.get_local(&ctx.reg(r));
+    ctx.builder.const_i32(!0xFFFF);
+    ctx.builder.and_i32();
+    ctx.builder.or_i32();
+    ctx.builder.set_local(&ctx.reg(r));
+}
+
 pub fn gen_set_reg16_local(builder: &mut WasmBuilder, local: &WasmLocal) {
     // reg32[r] = v & 0xFFFF | reg32[r] & ~0xFFFF
     builder.const_i32(0xFFFF);
@@ -396,7 +417,7 @@ pub fn gen_set_reg16_r(ctx: &mut JitContext, dest: u32, src: u32) {
     // generates: reg16[r_dest] = reg16[r_src]
     if src != dest {
         gen_get_reg16(ctx, src);
-        gen_set_reg16(ctx, dest);
+        gen_set_reg16_unmasked(ctx, dest);
     }
 }
 pub fn gen_set_reg32_r(ctx: &mut JitContext, dest: u32, src: u32) {
@@ -647,9 +668,6 @@ fn gen_safe_read(
     // where_to_write is only used by dqword
     dbg_assert!((where_to_write != None) == (bits == BitSize::DQWORD));
 
-    ctx.builder.const_i32(unsafe { memory::mem8 } as i32);
-    ctx.builder.add_i32();
-
     match bits {
         BitSize::BYTE => {
             ctx.builder.load_u8(0);
@@ -683,8 +701,15 @@ fn gen_safe_read(
     ctx.builder.free_local(entry_local);
 }
 
-pub fn gen_get_phys_eip(ctx: &mut JitContext, address_local: &WasmLocal) {
-    // Similar to gen_safe_read, but return the physical eip rather than reading from memory
+pub fn gen_get_phys_eip_plus_mem(ctx: &mut JitContext, address_local: &WasmLocal) {
+    // Similar to gen_safe_read, but return the physical eip + memory::mem rather than reading from memory
+    // In functions that need to use this value we need to fix it by substracting memory::mem
+    // this is done in order to remove one instruction from the fast path of memory accesses (no need to add
+    // memory::mem anymore ).
+    // We need to account for this in gen_page_switch_check and we compare with next_block_addr + memory::mem8
+    // We cannot the same while processing an AbsoluteEip flow control change so there we need to fix the value
+    // by subscracting memory::mem. Overall, since AbsoluteEip is encountered less often than memory accesses so
+    // this ends up improving perf.
     // Does not (need to) handle mapped memory
     // XXX: Currently does not use ctx.start_of_current_instruction, but rather assumes that eip is
     //      already correct (pointing at the current instruction)
@@ -723,6 +748,7 @@ pub fn gen_get_phys_eip(ctx: &mut JitContext, address_local: &WasmLocal) {
 
     ctx.builder.get_local(&address_local);
     ctx.builder.call_fn1_ret("get_phys_eip_slow_jit");
+
     ctx.builder.tee_local(&entry_local);
     ctx.builder.const_i32(1);
     ctx.builder.and_i32();
@@ -860,9 +886,6 @@ fn gen_safe_write(
     ctx.builder.get_local(&address_local);
     ctx.builder.xor_i32();
 
-    ctx.builder.const_i32(unsafe { memory::mem8 } as i32);
-    ctx.builder.add_i32();
-
     match value_local {
         GenSafeWriteValue::I32(local) => ctx.builder.get_local(local),
         GenSafeWriteValue::I64(local) => ctx.builder.get_local_i64(local),
@@ -999,9 +1022,6 @@ pub fn gen_safe_read_write(
     ctx.builder.and_i32();
     ctx.builder.get_local(&address_local);
     ctx.builder.xor_i32();
-
-    ctx.builder.const_i32(unsafe { memory::mem8 } as i32);
-    ctx.builder.add_i32();
 
     ctx.builder.free_local(entry_local);
     let phys_addr_local = ctx.builder.tee_new_local();
@@ -2232,7 +2252,7 @@ pub fn gen_profiler_stat_increment(builder: &mut WasmBuilder, stat: profiler::st
         return;
     }
     let addr = unsafe { profiler::stat_array.as_mut_ptr().offset(stat as isize) } as u32;
-    builder.increment_fixed_i32(addr, 1)
+    builder.increment_fixed_i64(addr, 1)
 }
 
 pub fn gen_debug_track_jit_exit(builder: &mut WasmBuilder, address: u32) {

@@ -36,6 +36,7 @@ use paging::OrPageFault;
 use profiler;
 use profiler::stat::*;
 use state_flags::CachedStateFlags;
+use std::collections::HashSet;
 pub use util::dbg_trace;
 
 /// The offset for our generated functions in the wasm table. Every index less than this is
@@ -272,7 +273,7 @@ pub static mut rdtsc_imprecision_offset: u64 = 0;
 pub static mut rdtsc_last_value: u64 = 0;
 pub static mut tsc_offset: u64 = 0;
 
-pub static mut tlb_data: [i32; 0x400000] = [0; 0x400000];
+pub static mut tlb_data: [i32; 0x100000] = [0; 0x100000];
 pub static mut valid_tlb_entries: [i32; 10000] = [0; 10000];
 pub static mut valid_tlb_entries_count: i32 = 0;
 
@@ -1746,7 +1747,7 @@ pub fn translate_address_read_no_side_effects(address: i32) -> Option<u32> {
     let entry = unsafe { tlb_data[(address as u32 >> 12) as usize] };
     let user = unsafe { *cpl } == 3;
     if entry & (TLB_VALID | if user { TLB_NO_USER } else { 0 }) == TLB_VALID {
-        Some((entry & !0xFFF ^ address) as u32)
+        Some((entry & !0xFFF ^ address) as u32 - unsafe { memory::mem8 } as u32)
     }
     else {
         match unsafe { do_page_walk(address, false, user, false) } {
@@ -1760,7 +1761,7 @@ pub fn translate_address_read(address: i32) -> OrPageFault<u32> {
     let entry = unsafe { tlb_data[(address as u32 >> 12) as usize] };
     let user = unsafe { *cpl == 3 };
     if entry & (TLB_VALID | if user { TLB_NO_USER } else { 0 }) == TLB_VALID {
-        Ok((entry & !0xFFF ^ address) as u32)
+        Ok((entry & !0xFFF ^ address) as u32 - unsafe { memory::mem8 } as u32)
     }
     else {
         Ok((unsafe { do_page_translation(address, false, user) }? | address & 0xFFF) as u32)
@@ -1771,7 +1772,7 @@ pub unsafe fn translate_address_read_jit(address: i32) -> OrPageFault<u32> {
     let entry = tlb_data[(address as u32 >> 12) as usize];
     let user = *cpl == 3;
     if entry & (TLB_VALID | if user { TLB_NO_USER } else { 0 }) == TLB_VALID {
-        Ok((entry & !0xFFF ^ address) as u32)
+        Ok((entry & !0xFFF ^ address) as u32 - memory::mem8 as u32)
     }
     else {
         match do_page_walk(address, false, user, true) {
@@ -1945,7 +1946,7 @@ pub unsafe fn do_page_walk(
     // XXX: There will probably be duplicates due to invlpg deleting
     // entries from tlb_data but not from valid_tlb_entries
     }
-    else if CHECK_TLB_INVARIANTS {
+    else if side_effects && CHECK_TLB_INVARIANTS {
         let mut found: bool = false;
         for i in 0..valid_tlb_entries_count {
             if valid_tlb_entries[i as usize] == page {
@@ -1965,7 +1966,9 @@ pub unsafe fn do_page_walk(
         | if has_code { TLB_HAS_CODE } else { 0 };
     dbg_assert!((high ^ page << 12) & 0xFFF == 0);
     if side_effects {
-        tlb_data[page as usize] = high ^ page << 12 | info_bits
+        // bake in the addition with memory::mem8 to save an instruction from the fast path
+        // of memory accesses
+        tlb_data[page as usize] = (high + memory::mem8 as i32) ^ page << 12 | info_bits as i32;
     }
     return Ok(high);
 }
@@ -2086,8 +2089,7 @@ pub unsafe fn trigger_gp_jit(code: i32, start_eip: i32) {
 
 #[no_mangle]
 pub unsafe fn trigger_fault_end_jit() {
-    let (code, error_code) = jit_fault.unwrap();
-    jit_fault = None;
+    let (code, error_code) = jit_fault.take().unwrap();
     if DEBUG {
         if cpu_exception_hook(code) {
             return;
@@ -2130,7 +2132,10 @@ pub unsafe fn translate_address_write_and_can_skip_dirty(address: i32) -> OrPage
     let entry = tlb_data[(address as u32 >> 12) as usize];
     let user = *cpl == 3;
     if entry & (TLB_VALID | if user { TLB_NO_USER } else { 0 } | TLB_READONLY) == TLB_VALID {
-        return Ok(((entry & !0xFFF ^ address) as u32, entry & TLB_HAS_CODE == 0));
+        return Ok((
+            (entry & !0xFFF ^ address) as u32 - memory::mem8 as u32,
+            entry & TLB_HAS_CODE == 0,
+        ));
     }
     else {
         return Ok((
@@ -2144,7 +2149,7 @@ pub unsafe fn translate_address_write(address: i32) -> OrPageFault<u32> {
     let entry = tlb_data[(address as u32 >> 12) as usize];
     let user = *cpl == 3;
     if entry & (TLB_VALID | if user { TLB_NO_USER } else { 0 } | TLB_READONLY) == TLB_VALID {
-        return Ok((entry & !0xFFF ^ address) as u32);
+        return Ok((entry & !0xFFF ^ address) as u32 - memory::mem8 as u32);
     }
     else {
         return Ok((do_page_translation(address, true, user)? | address & 0xFFF) as u32);
@@ -2155,7 +2160,7 @@ pub unsafe fn translate_address_write_jit(address: i32) -> OrPageFault<u32> {
     let entry = tlb_data[(address as u32 >> 12) as usize];
     let user = *cpl == 3;
     if entry & (TLB_VALID | if user { TLB_NO_USER } else { 0 } | TLB_READONLY) == TLB_VALID {
-        Ok((entry & !0xFFF ^ address) as u32)
+        Ok((entry & !0xFFF ^ address) as u32 - memory::mem8 as u32)
     }
     else {
         match do_page_walk(address, true, user, true) {
@@ -2169,13 +2174,34 @@ pub unsafe fn translate_address_write_jit(address: i32) -> OrPageFault<u32> {
 }
 
 pub fn tlb_set_has_code(physical_page: Page, has_code: bool) {
-    let physical_page = physical_page.to_u32();
     for i in 0..unsafe { valid_tlb_entries_count } {
         let page = unsafe { valid_tlb_entries[i as usize] };
         let entry = unsafe { tlb_data[page as usize] };
         if 0 != entry {
-            let tlb_physical_page = entry as u32 >> 12 ^ page as u32;
+            let tlb_physical_page = Page::of_u32(
+                (entry as u32 >> 12 ^ page as u32) - (unsafe { memory::mem8 } as u32 >> 12),
+            );
             if physical_page == tlb_physical_page {
+                unsafe {
+                    tlb_data[page as usize] =
+                        if has_code { entry | TLB_HAS_CODE } else { entry & !TLB_HAS_CODE }
+                }
+            }
+        }
+    }
+
+    check_tlb_invariants();
+}
+pub fn tlb_set_has_code_multiple(physical_pages: &HashSet<Page>, has_code: bool) {
+    let physical_pages: Vec<Page> = physical_pages.into_iter().copied().collect();
+    for i in 0..unsafe { valid_tlb_entries_count } {
+        let page = unsafe { valid_tlb_entries[i as usize] };
+        let entry = unsafe { tlb_data[page as usize] };
+        if 0 != entry {
+            let tlb_physical_page = Page::of_u32(
+                (entry as u32 >> 12 ^ page as u32) - (unsafe { memory::mem8 } as u32 >> 12),
+            );
+            if physical_pages.contains(&tlb_physical_page) {
                 unsafe {
                     tlb_data[page as usize] =
                         if has_code { entry | TLB_HAS_CODE } else { entry & !TLB_HAS_CODE }
@@ -2201,7 +2227,7 @@ pub fn check_tlb_invariants() {
             continue;
         }
 
-        let target = (entry ^ page << 12) as u32;
+        let target = (entry ^ page << 12) as u32 - unsafe { memory::mem8 } as u32;
         dbg_assert!(!in_mapped_range(target));
 
         let entry_has_code = entry & TLB_HAS_CODE != 0;
@@ -2846,7 +2872,8 @@ unsafe fn jit_run_interpreted(phys_addr: u32) {
 
     while !jit_block_boundary
         && Page::page_of(*previous_ip as u32) == Page::page_of(*instruction_pointer as u32)
-        && i < INTERPRETER_ITERATION_LIMIT
+        && (i < INTERPRETER_ITERATION_LIMIT
+            || (*previous_ip as u32) < (*instruction_pointer as u32))
     {
         *previous_ip = *instruction_pointer;
         let opcode = return_on_pagefault!(read_imm8());
@@ -3203,7 +3230,7 @@ pub unsafe fn safe_read_slow_jit(addr: i32, bitsize: i32, start_eip: i32, is_wri
             *(scratch as *mut u8).offset((0x1000 | s & 0xFFF) as isize) = read8(s) as u8
         }
 
-        (((scratch - mem8 as u32) as i32) ^ addr) & !0xFFF
+        ((scratch as i32) ^ addr) & !0xFFF
     }
     else if in_mapped_range(addr_low) {
         let scratch = jit_paging_scratch_buffer.0.as_mut_ptr() as u32;
@@ -3213,10 +3240,10 @@ pub unsafe fn safe_read_slow_jit(addr: i32, bitsize: i32, start_eip: i32, is_wri
             *(scratch as *mut u8).offset((s & 0xFFF) as isize) = read8(s) as u8
         }
 
-        (((scratch - mem8 as u32) as i32) ^ addr) & !0xFFF
+        ((scratch as i32) ^ addr) & !0xFFF
     }
     else {
-        (addr_low as i32 ^ addr) & !0xFFF
+        ((addr_low as i32 + memory::mem8 as i32) ^ addr) & !0xFFF
     }
 }
 
@@ -3247,7 +3274,7 @@ pub unsafe fn get_phys_eip_slow_jit(addr: i32) -> i32 {
         Err(()) => 1,
         Ok(addr_low) => {
             dbg_assert!(!in_mapped_range(addr_low as u32)); // same assumption as in read_imm8
-            (addr_low as i32 ^ addr) & !0xFFF
+            ((addr_low as i32 + memory::mem8 as i32) ^ addr) & !0xFFF
         },
     }
 }
@@ -3326,7 +3353,7 @@ pub unsafe fn safe_write_slow_jit(
 
         let scratch = jit_paging_scratch_buffer.0.as_mut_ptr() as u32;
         dbg_assert!(scratch & 0xFFF == 0);
-        ((scratch as i32 - mem8 as i32) ^ addr) & !0xFFF
+        ((scratch as i32) ^ addr) & !0xFFF
     }
     else if in_mapped_range(addr_low) {
         match bitsize {
@@ -3339,18 +3366,18 @@ pub unsafe fn safe_write_slow_jit(
             ),
             64 => memory::mmap_write64(addr_low, value_low as i32, (value_low >> 32) as i32),
             32 => memory::mmap_write32(addr_low, value_low as i32),
-            16 => memory::mmap_write16(addr_low, value_low as i32),
-            8 => memory::mmap_write8(addr_low, value_low as i32),
+            16 => memory::mmap_write16(addr_low, (value_low & 0xFFFF) as i32),
+            8 => memory::mmap_write8(addr_low, (value_low & 0xFF) as i32),
             _ => dbg_assert!(false),
         }
 
         let scratch = jit_paging_scratch_buffer.0.as_mut_ptr() as u32;
         dbg_assert!(scratch & 0xFFF == 0);
-        ((scratch as i32 - mem8 as i32) ^ addr) & !0xFFF
+        ((scratch as i32) ^ addr) & !0xFFF
     }
     else {
         jit::jit_dirty_page(jit::get_jit_state(), Page::page_of(addr_low));
-        (addr_low as i32 ^ addr) & !0xFFF
+        ((addr_low as i32 + memory::mem8 as i32) ^ addr) & !0xFFF
     }
 }
 
@@ -3756,6 +3783,7 @@ pub unsafe fn vm86_mode() -> bool { return *flags & FLAG_VM == FLAG_VM; }
 pub unsafe fn getiopl() -> i32 { return *flags >> 12 & 3; }
 
 #[no_mangle]
+#[cfg(feature = "profiler")]
 pub unsafe fn get_opstats_buffer(
     compiled: bool,
     jit_exit: bool,
@@ -3765,24 +3793,33 @@ pub unsafe fn get_opstats_buffer(
     is_0f: bool,
     is_mem: bool,
     fixed_g: u8,
-) -> u32 {
-    let index = (is_0f as u32) << 12 | (opcode as u32) << 4 | (is_mem as u32) << 3 | fixed_g as u32;
-    if compiled {
-        *opstats_compiled_buffer.offset(index as isize)
-    }
-    else if jit_exit {
-        *opstats_jit_exit_buffer.offset(index as isize)
-    }
-    else if unguarded_register {
-        *opstats_unguarded_register_buffer.offset(index as isize)
-    }
-    else if wasm_size {
-        *opstats_wasm_size.offset(index as isize)
-    }
-    else {
-        *opstats_buffer.offset(index as isize)
+) -> f64 {
+    {
+        let index = (is_0f as usize) << 12
+            | (opcode as usize) << 4
+            | (is_mem as usize) << 3
+            | fixed_g as usize;
+        (if compiled {
+            ::opstats::opstats_compiled_buffer[index]
+        }
+        else if jit_exit {
+            ::opstats::opstats_jit_exit_buffer[index]
+        }
+        else if unguarded_register {
+            ::opstats::opstats_unguarded_register_buffer[index]
+        }
+        else if wasm_size {
+            ::opstats::opstats_wasm_size[index]
+        }
+        else {
+            ::opstats::opstats_buffer[index]
+        }) as f64
     }
 }
+
+#[no_mangle]
+#[cfg(not(feature = "profiler"))]
+pub unsafe fn get_opstats_buffer() -> f64 { 0.0 }
 
 pub unsafe fn invlpg(addr: i32) {
     let page = (addr as u32 >> 12) as i32;
@@ -3864,7 +3901,7 @@ pub unsafe fn get_valid_global_tlb_entries_count() -> i32 {
 pub unsafe fn translate_address_system_read(address: i32) -> OrPageFault<u32> {
     let entry = tlb_data[(address as u32 >> 12) as usize];
     if 0 != entry & TLB_VALID {
-        return Ok((entry & !0xFFF ^ address) as u32);
+        return Ok((entry & !0xFFF ^ address) as u32 - memory::mem8 as u32);
     }
     else {
         return Ok((do_page_translation(address, false, false)? | address & 0xFFF) as u32);
@@ -3874,7 +3911,7 @@ pub unsafe fn translate_address_system_read(address: i32) -> OrPageFault<u32> {
 pub unsafe fn translate_address_system_write(address: i32) -> OrPageFault<u32> {
     let entry = tlb_data[(address as u32 >> 12) as usize];
     if entry & (TLB_VALID | TLB_READONLY) == TLB_VALID {
-        return Ok((entry & !0xFFF ^ address) as u32);
+        return Ok((entry & !0xFFF ^ address) as u32 - memory::mem8 as u32);
     }
     else {
         return Ok((do_page_translation(address, true, false)? | address & 0xFFF) as u32);

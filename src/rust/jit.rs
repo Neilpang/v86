@@ -873,9 +873,7 @@ fn jit_analyze_and_generate(
     );
     profiler::stat_increment_by(stat::COMPILE_PAGE, pages.len() as u64);
 
-    for &p in &pages {
-        cpu::tlb_set_has_code(p, true);
-    }
+    cpu::tlb_set_has_code_multiple(&pages, true);
 
     dbg_assert!(ctx.compiling.is_none());
     ctx.compiling = Some((wasm_table_index, PageState::Compiling { entries }));
@@ -1166,7 +1164,9 @@ fn jit_generate_module(
                         // Check if we can stay in this module, if not exit
                         codegen::gen_get_eip(ctx.builder);
                         let new_eip = ctx.builder.set_new_local();
-                        codegen::gen_get_phys_eip(ctx, &new_eip);
+                        codegen::gen_get_phys_eip_plus_mem(ctx, &new_eip);
+                        ctx.builder.const_i32(unsafe { memory::mem8 } as i32);
+                        ctx.builder.sub_i32();
                         ctx.builder.free_local(new_eip);
 
                         ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
@@ -1856,7 +1856,7 @@ fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
         let was_block_boundary = instruction_flags & JIT_INSTR_BLOCK_BOUNDARY_FLAG != 0;
 
         let wasm_length = ctx.builder.instruction_body_length() - wasm_length_before;
-        opstats::record_opstat_size_wasm(instruction, wasm_length as u32);
+        opstats::record_opstat_size_wasm(instruction, wasm_length as u64);
 
         dbg_assert!((end_eip == stop_addr) == (start_eip == last_instruction_addr));
         dbg_assert!(instruction_length < MAX_INSTRUCTION_LENGTH);
@@ -2176,6 +2176,7 @@ pub fn check_dispatcher_target(target_index: i32, max: i32) {
 }
 
 #[no_mangle]
+#[cfg(feature = "profiler")]
 pub fn enter_basic_block(phys_eip: u32) {
     let eip =
         unsafe { cpu::translate_address_read(*global_pointers::instruction_pointer).unwrap() };
